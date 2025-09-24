@@ -8,6 +8,8 @@ import io.kestra.core.models.executions.statistics.ExecutionCount;
 import io.kestra.core.models.executions.statistics.Flow;
 import io.kestra.core.models.flows.FlowScope;
 import io.kestra.core.models.flows.State;
+import io.kestra.core.runners.Executor;
+import io.kestra.core.runners.ExecutorState;
 import io.kestra.core.utils.DateUtils;
 import io.kestra.plugin.core.dashboard.data.Executions;
 import io.micronaut.data.model.Pageable;
@@ -16,6 +18,7 @@ import jakarta.validation.constraints.NotNull;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.experimental.SuperBuilder;
+import org.apache.commons.lang3.tuple.Pair;
 import reactor.core.publisher.Flux;
 
 import java.time.ZonedDateTime;
@@ -154,4 +157,6 @@ public interface ExecutionRepositoryInterface extends SaveRepositoryInterface<Ex
         String tenantId,
         @Nullable List<FlowFilter> flows
     );
+
+    Executor lock(String executionId, Function<Pair<Execution, ExecutorState>, Pair<Executor, ExecutorState>> function);
 }

@@ -67,8 +67,6 @@ import static io.kestra.core.utils.Rethrow.throwConsumer;
 import static io.kestra.core.utils.Rethrow.throwFunction;
 
 @SuppressWarnings("deprecation")
-@Singleton
-@JdbcRunnerEnabled
 @Slf4j
 public class JdbcExecutor implements ExecutorInterface {
     private static final ObjectMapper MAPPER = JdbcMapper.of();
@@ -231,7 +229,6 @@ public class JdbcExecutor implements ExecutorInterface {
      * @param flowTopologyRepository     The {@link AbstractJdbcFlowTopologyRepository}.
      * @param eventPublisher             The {@link ApplicationEventPublisher}.
      */
-    @Inject
     public JdbcExecutor(
         @Nullable final JdbcServiceLivenessCoordinator serviceLivenessCoordinator,
         final FlowMetaStoreInterface flowMetaStore,
@@ -1188,7 +1185,6 @@ public class JdbcExecutor implements ExecutorInterface {
             }
         }
     }
-
     private FlowWithSource findFlow(Execution execution) {
         FlowInterface flow = this.flowMetaStore.findByExecution(execution).orElseThrow();
         FlowWithSource flowWithSource = pluginDefaultService.injectDefaults(flow, execution);
@@ -1207,6 +1203,7 @@ public class JdbcExecutor implements ExecutorInterface {
 
         return flowWithSource;
     }
+
 
     /**
      * ExecutionDelay is currently two types of execution:

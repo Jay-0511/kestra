@@ -35,6 +35,14 @@ public class MysqlQueueFactory implements QueueFactoryInterface {
 
     @Override
     @Singleton
+    @Named(QueueFactoryInterface.EXECUTION_EVENT_NAMED)
+    @Bean(preDestroy = "close")
+    public QueueInterface<ExecutionEvent> executionEvent() {
+        return new MysqlQueue<>(ExecutionEvent.class, applicationContext);
+    }
+
+    @Override
+    @Singleton
     @Named(QueueFactoryInterface.EXECUTOR_NAMED)
     @Bean(preDestroy = "close")
     public QueueInterface<Executor> executor() {
