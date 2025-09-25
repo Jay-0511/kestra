@@ -64,18 +64,17 @@ public class ExecutionStreamingService {
             }
 
             ExecutionEvent event = either.getLeft();
-            Optional<Execution> execution = executionRepository.findById(event.tenantId(), event.executionId());
-            if (execution.isEmpty()) {
-                log.error("Unable to find the execution id {}", event.executionId());
-                return;
-            }
-
-            String executionId = execution.get().getId();
 
             // Get all subscribers for this execution
-            Map<String, Pair<FluxSink<Event<Execution>>, Flow>> executionSubscribers = subscribers.get(executionId);
+            Map<String, Pair<FluxSink<Event<Execution>>, Flow>> executionSubscribers = subscribers.get(event.executionId());
 
             if (!MapUtils.isEmpty(executionSubscribers)) {
+                Optional<Execution> execution = executionRepository.findById(event.tenantId(), event.executionId());
+                if (execution.isEmpty()) {
+                    log.error("Unable to find the execution id {}", event.executionId());
+                    return;
+                }
+
                 executionSubscribers.values().forEach(pair -> {
                     var sink = pair.getLeft();
                     var flow = pair.getRight();

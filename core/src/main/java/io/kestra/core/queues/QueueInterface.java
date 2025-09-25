@@ -35,6 +35,24 @@ public interface QueueInterface<T> extends Closeable, Pauseable {
 
     void delete(String consumerGroup, T message) throws QueueException;
 
+    /**
+     * Delete all messages of the queue for this key.
+     * This is used to purge a queue for a specific key.
+     * A queue implementation may omit to implement it and purge records differently.
+     */
+    default void deleteByKey(String key) throws QueueException {
+        // by default do nothing
+    }
+
+    /**
+     * Delete all messages of the queue for a set of keys.
+     * This is used to purge a queue for specific keys.
+     * A queue implementation may omit to implement it and purge records differently.
+     */
+    default void deleteByKeys(List<String> keys) throws QueueException {
+        // by default do nothing
+    }
+
     default Runnable receive(Consumer<Either<T, DeserializationException>> consumer) {
         return receive(null, consumer, false);
     }

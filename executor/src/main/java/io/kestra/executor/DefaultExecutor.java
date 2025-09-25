@@ -4,6 +4,7 @@ import io.kestra.core.exceptions.DeserializationException;
 import io.kestra.core.exceptions.InternalException;
 import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.executions.LogEntry;
+import io.kestra.core.models.executions.TaskRun;
 import io.kestra.core.models.flows.*;
 import io.kestra.core.models.tasks.WorkerGroup;
 import io.kestra.core.queues.QueueException;
@@ -13,13 +14,16 @@ import io.kestra.core.repositories.ExecutionRepositoryInterface;
 import io.kestra.core.runners.*;
 import io.kestra.core.server.ServiceStateChangeEvent;
 import io.kestra.core.server.ServiceType;
+import io.kestra.core.services.ExecutionService;
 import io.kestra.core.services.PluginDefaultService;
 import io.kestra.core.services.WorkerGroupService;
 import io.kestra.core.trace.Tracer;
 import io.kestra.core.trace.TracerFactory;
 import io.kestra.core.utils.Either;
 import io.kestra.core.utils.IdUtils;
+import io.kestra.core.utils.ListUtils;
 import io.kestra.core.utils.TruthUtils;
+import io.micronaut.context.annotation.Value;
 import io.micronaut.context.event.ApplicationEventPublisher;
 import jakarta.inject.Inject;
 import jakarta.inject.Named;
@@ -68,9 +72,17 @@ public class DefaultExecutor implements ExecutorInterface {
     private ExecutorService executorService;
     @Inject
     private WorkerGroupService workerGroupService;
+    @Inject
+    private ExecutionService executionService;
 
     @Inject
     private FlowMetaStoreInterface flowMetaStore;
+
+    // FIXME change config names
+    @Value("${kestra.jdbc.executor.clean.execution-queue:false}")
+    private boolean cleanExecutionQueue;
+    @Value("${kestra.jdbc.executor.clean.worker-queue:false}")
+    private boolean cleanWorkerJobQueue;
 
     private final AtomicReference<ServiceState> state = new AtomicReference<>();
     private final String id = IdUtils.create();
@@ -104,6 +116,7 @@ public class DefaultExecutor implements ExecutorInterface {
         }
 
         Execution message = either.getLeft();
+//        System.out.println("executionQueue: " + message.getId() + " - " + message.getState().getCurrent());
         if (skipExecutionService.skipExecution(message)) {
             log.warn("Skipping execution {}", message.getId());
             return;
@@ -141,6 +154,8 @@ public class DefaultExecutor implements ExecutorInterface {
             return;
         }
 
+//        System.out.println("executionEventQueue: " + message);
+
         // FIXME remove the state as it's not needed anymore
         Executor result = executionRepository.lock(message.executionId(), pair -> {
             Execution execution = pair.getLeft();
@@ -159,7 +174,7 @@ public class DefaultExecutor implements ExecutorInterface {
                         }
                         executor = executorService.process(executor);
 
-                        if (!executor.getNexts().isEmpty()) {
+                        if (!executor.getNexts().isEmpty() && deduplicateNexts(execution, executorState, executor.getNexts())) {
                             executor.withExecution(
                                 executorService.onNexts(executor.getExecution(), executor.getNexts()),
                                 "onNexts"
@@ -171,6 +186,8 @@ public class DefaultExecutor implements ExecutorInterface {
                             List<WorkerTaskResult> workerTaskResults = new ArrayList<>();
                             executor
                                 .getWorkerTasks()
+                                .stream()
+                                .filter(workerTask -> this.deduplicateWorkerTask(execution, executorState, workerTask.getTaskRun()))
                                 .forEach(throwConsumer(workerTask -> {
                                     try {
                                         if (!TruthUtils.isTruthy(workerTask.getRunContext().render(workerTask.getTask().getRunIf()))) {
@@ -213,6 +230,11 @@ public class DefaultExecutor implements ExecutorInterface {
     }
 
     private void workerTaskResultQueue(Either<WorkerTaskResult, DeserializationException> either) {
+        if (either == null) {
+            // FIXME it happens in Kafka but sould not? or maybe it should...
+            return;
+        }
+
         if (either.isRight()) {
             log.error("Unable to deserialize a worker task result: {}", either.getRight().getMessage(), either.getRight());
             return;
@@ -227,6 +249,8 @@ public class DefaultExecutor implements ExecutorInterface {
         if (log.isDebugEnabled()) {
             executorService.log(log, true, message);
         }
+
+//        System.out.println("workerTaskResultQueue: " + message.getTaskRun().getExecutionId());
 
         Executor executor = executionRepository.lock(message.getTaskRun().getExecutionId(), pair -> {
             Execution execution = pair.getLeft();
@@ -273,25 +297,60 @@ public class DefaultExecutor implements ExecutorInterface {
             }
 
             if (!shouldSend) {
+                // delete the execution from the state storage if ended
+                // IMPORTANT: it must be done here as it's when the execution arrives 'again' with a terminated state,
+                // so we are sure at this point that no new executions will be created otherwise the tate storage would be re-created by the execution queue.
+                if (executorService.canBePurged(executor)) {
+                    // TODO executorStateStorage.delete(executor.getExecution());
+                }
+
                 return;
             }
 
             if (log.isDebugEnabled()) {
                 executorService.log(log, false, executor);
             }
-            ExecutionEvent event = new ExecutionEvent(executor.getExecution(), ExecutionEventType.UPDATED); // TODO terminated
-            // TODO transaction between repo and queue
-            this.executionRepository.update(executor.getExecution());
-            this.executionEventQueue.emit(event);
+
+            // the terminated state can come from the execution queue, in this case we always have a flow in the executor
+            // or from a worker task in an afterExecution block, in this case we need to load the flow
+            if (executor.getFlow() == null && executor.getExecution().getState().isTerminated()) {
+                executor = executor.withFlow(findFlow(executor.getExecution()));
+            }
+            boolean isTerminated = executor.getFlow() != null && executionService.isTerminated(executor.getFlow(), executor.getExecution());
+
+            // IMPORTANT: this must be done before emitting the last execution message so that all consumers are notified that the execution ends.
+            // NOTE: we may also purge ExecutionKilled events, but as there may not be a lot of them, it may not be worth it.
+            if (isTerminated) {
+                if (cleanExecutionQueue) {
+                    executionEventQueue.deleteByKey(executor.getExecution().getId());
+                    executionQueue.deleteByKey(executor.getExecution().getId());
+                }
+
+                // Purge the workerTaskResultQueue and the workerJobQueue
+                // IMPORTANT: this is safe as only the executor is listening to WorkerTaskResult,
+                // and we are sure at this stage that all WorkerJob has been listened and processed by the Worker.
+                // If any of these assumptions changed, this code would not be safe anymore.
+                if (cleanWorkerJobQueue && !ListUtils.isEmpty(executor.getExecution().getTaskRunList())) {
+                    List<String> taskRunKeys = executor.getExecution().getTaskRunList().stream()
+                        .map(taskRun -> taskRun.getId())
+                        .toList();
+                    workerTaskResultQueue.deleteByKeys(taskRunKeys);
+                    workerJobQueue.deleteByKeys(taskRunKeys);
+                }
+
+                ExecutionEvent event = new ExecutionEvent(executor.getExecution(), ExecutionEventType.TERMINATED);
+                this.executionEventQueue.emit(event);
+            } else {
+                ExecutionEvent event = new ExecutionEvent(executor.getExecution(), ExecutionEventType.UPDATED);
+                this.executionEventQueue.emit(event);
+            }
         } catch (QueueException e) {
             // If we cannot add the new worker task result to the execution, we fail it
             executionRepository.lock(executor.getExecution().getId(), pair -> {
                 Execution execution = pair.getLeft();
                 try {
                     Execution failed = execution.failedExecutionFromExecutor(e).getExecution().withState(State.Type.FAILED);
-                    ExecutionEvent event = new ExecutionEvent(failed, ExecutionEventType.UPDATED); // TODO terminated
-                    // TODO transaction between repo and queue
-                    this.executionRepository.update(failed);
+                    ExecutionEvent event = new ExecutionEvent(failed, ExecutionEventType.TERMINATED);
                     this.executionEventQueue.emit(event);
                 } catch (QueueException ex) {
                     log.error("Unable to emit the execution {}", execution.getId(), ex);
@@ -318,6 +377,42 @@ public class DefaultExecutor implements ExecutorInterface {
         return executor.withExecution(failedExecutionWithLog.getExecution(), "exception");
     }
 
+    private boolean deduplicateNexts(Execution execution, ExecutorState executorState, List<TaskRun> taskRuns) {
+        return taskRuns
+            .stream()
+            .anyMatch(taskRun -> {
+                // As retry is now handled outside the worker,
+                // we now add the attempt size to the deduplication key
+                String deduplicationKey = taskRun.getParentTaskRunId() + "-" +
+                    taskRun.getTaskId() + "-" +
+                    taskRun.getValue() + "-" +
+                    (taskRun.getAttempts() != null ? taskRun.getAttempts().size() : 0)
+                    + taskRun.getIteration();
+
+                if (executorState.getChildDeduplication().containsKey(deduplicationKey)) {
+                    log.warn("Duplicate Nexts on execution '{}' with key '{}'", execution.getId(), deduplicationKey);
+                    return false;
+                } else {
+                    executorState.getChildDeduplication().put(deduplicationKey, taskRun.getId());
+                    return true;
+                }
+            });
+    }
+
+    private boolean deduplicateWorkerTask(Execution execution, ExecutorState executorState, TaskRun taskRun) {
+        String deduplicationKey = taskRun.getId() +
+            (taskRun.getAttempts() != null ? taskRun.getAttempts().size() : 0)
+            + taskRun.getIteration();
+        State.Type current = executorState.getWorkerTaskDeduplication().get(deduplicationKey);
+
+        if (current == taskRun.getState().getCurrent()) {
+            log.warn("Duplicate WorkerTask on execution '{}' for taskRun '{}', value '{}, taskId '{}'", execution.getId(), taskRun.getId(), taskRun.getValue(), taskRun.getTaskId());
+            return false;
+        } else {
+            executorState.getWorkerTaskDeduplication().put(deduplicationKey, taskRun.getState().getCurrent());
+            return true;
+        }
+    }
 
     @Override
     public String getId() {

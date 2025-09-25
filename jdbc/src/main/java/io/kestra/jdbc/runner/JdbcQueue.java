@@ -185,10 +185,7 @@ public abstract class JdbcQueue<T> implements QueueInterface<T> {
         // and the queue has its own cleaner, which we better not mess with, as the 'queues' table is selected with a lock.
     }
 
-    /**
-     * Delete all messages of the queue for this key.
-     * This is used to purge a queue for a specific key.
-     */
+    @Override
     public void deleteByKey(String key) throws QueueException {
         dslContextWrapper.transaction(configuration -> {
             int deleted = DSL
