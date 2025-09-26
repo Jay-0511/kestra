@@ -72,4 +72,20 @@ public interface QueueInterface<T> extends Closeable, Pauseable {
     }
 
     Runnable receive(String consumerGroup, Class<?> queueType, Consumer<Either<T, DeserializationException>> consumer, boolean forUpdate);
+
+    default Runnable receiveBatch(Class<?> queueType, Consumer<List<Either<T, DeserializationException>>> consumer) {
+        return receiveBatch(null, queueType, consumer);
+    }
+
+    default Runnable receiveBatch(String consumerGroup, Class<?> queueType, Consumer<List<Either<T, DeserializationException>>> consumer) {
+        return receiveBatch(consumerGroup, queueType, consumer, true);
+    }
+
+    /**
+     * Consumer a batch of messages.
+     * By default, it consumes a single message, a queue implementation may implement it to support batch consumption.
+     */
+    default Runnable receiveBatch(String consumerGroup, Class<?> queueType, Consumer<List<Either<T, DeserializationException>>> consumer, boolean forUpdate) {
+        return receive(consumerGroup, either -> consumer.accept(List.of(either)), forUpdate);
+    }
 }

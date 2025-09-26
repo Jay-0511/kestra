@@ -19,10 +19,7 @@ import io.kestra.core.services.PluginDefaultService;
 import io.kestra.core.services.WorkerGroupService;
 import io.kestra.core.trace.Tracer;
 import io.kestra.core.trace.TracerFactory;
-import io.kestra.core.utils.Either;
-import io.kestra.core.utils.IdUtils;
-import io.kestra.core.utils.ListUtils;
-import io.kestra.core.utils.TruthUtils;
+import io.kestra.core.utils.*;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.context.event.ApplicationEventPublisher;
 import jakarta.inject.Inject;
@@ -35,6 +32,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.kestra.core.utils.Rethrow.throwConsumer;
@@ -79,9 +77,9 @@ public class DefaultExecutor implements ExecutorInterface {
     private FlowMetaStoreInterface flowMetaStore;
 
     // FIXME change config names
-    @Value("${kestra.jdbc.executor.clean.execution-queue:false}")
+    @Value("${kestra.jdbc.executor.clean.execution-queue:true}")
     private boolean cleanExecutionQueue;
-    @Value("${kestra.jdbc.executor.clean.worker-queue:false}")
+    @Value("${kestra.jdbc.executor.clean.worker-queue:true}")
     private boolean cleanWorkerJobQueue;
 
     private final AtomicReference<ServiceState> state = new AtomicReference<>();
@@ -89,10 +87,19 @@ public class DefaultExecutor implements ExecutorInterface {
     private final List<Runnable> receiveCancellations = new ArrayList<>();
 
     private final Tracer tracer;
+    private final java.util.concurrent.ExecutorService workerTaskResultExecutorService;
+    private final java.util.concurrent.ExecutorService executionExecutorService;
 
     @Inject
-    public DefaultExecutor(TracerFactory tracerFactory) {
+    public DefaultExecutor(TracerFactory tracerFactory, ExecutorsUtils executorsUtils, @Value("${kestra.jdbc.executor.thread-count:0}") int threadCount) {
         this.tracer = tracerFactory.getTracer(DefaultExecutor.class, "EXECUTOR");
+
+        // By default, we start available processors count threads with a minimum of 4 by executor service
+        // for the worker task result queue and the execution queue.
+        // Other queues would not benefit from more consumers.
+        int numberOfThreads = threadCount != 0 ? threadCount : Math.max(4, Runtime.getRuntime().availableProcessors());
+        this.workerTaskResultExecutorService = executorsUtils.maxCachedThreadPool(numberOfThreads, "jdbc-worker-task-result-executor");
+        this.executionExecutorService = executorsUtils.maxCachedThreadPool(numberOfThreads, "jdbc-execution-executor");
     }
 
     @Override
@@ -101,8 +108,24 @@ public class DefaultExecutor implements ExecutorInterface {
 
         // listen to executor related queues
         this.receiveCancellations.addFirst(this.executionQueue.receive(Executor.class, execution -> executionQueue(execution)));
-        this.receiveCancellations.addFirst(this.executionEventQueue.receive(Executor.class, execution -> executionEventQueue(execution)));
-        this.receiveCancellations.addFirst(this.workerTaskResultQueue.receive(Executor.class, workerTaskResults -> workerTaskResultQueue(workerTaskResults)));
+        this.receiveCancellations.addFirst(this.executionEventQueue.receiveBatch(
+            Executor.class,
+            executionEvents -> {
+                List<CompletableFuture<Void>> futures = executionEvents.stream()
+                    .map(executionEvent -> CompletableFuture.runAsync(() -> executionEventQueue(executionEvent), executionExecutorService))
+                    .toList();
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            }
+        ));
+        this.receiveCancellations.addFirst(this.workerTaskResultQueue.receiveBatch(
+            Executor.class,
+            workerTaskResults -> {
+                List<CompletableFuture<Void>> futures = workerTaskResults.stream()
+                    .map(workerTaskResult -> CompletableFuture.runAsync(() -> workerTaskResultQueue(workerTaskResult), workerTaskResultExecutorService))
+                    .toList();
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            }
+        ));
 
         setState(ServiceState.RUNNING);
         log.info("Executor started");

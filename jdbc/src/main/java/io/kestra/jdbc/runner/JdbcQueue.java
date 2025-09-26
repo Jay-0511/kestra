@@ -333,14 +333,7 @@ public abstract class JdbcQueue<T> implements QueueInterface<T> {
         );
     }
 
-    public Runnable receiveBatch(Class<?> queueType, Consumer<List<Either<T, DeserializationException>>> consumer) {
-        return receiveBatch(null, queueType, consumer);
-    }
-
-    public Runnable receiveBatch(String consumerGroup, Class<?> queueType, Consumer<List<Either<T, DeserializationException>>> consumer) {
-        return receiveBatch(consumerGroup, queueType, consumer, true);
-    }
-
+    @Override
     public Runnable receiveBatch(String consumerGroup, Class<?> queueType, Consumer<List<Either<T, DeserializationException>>> consumer, boolean forUpdate) {
         return this.receiveImpl(
             consumerGroup,
